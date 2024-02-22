@@ -19,10 +19,12 @@ import { MenuId } from 'vs/platform/actions/common/actions';
 import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
 import { IObjectData, IPooledObject } from './objectPool';
 import { ActionRunnerWithContext } from './utils';
+import { createActionViewItem } from 'vs/platform/actions/browser/menuEntryActionViewItem';
 
 export class TemplateData implements IObjectData {
 	constructor(
 		public readonly viewModel: DocumentDiffItemViewModel,
+		public readonly deltaScrollVertical: (delta: number) => void,
 	) { }
 
 
@@ -36,9 +38,9 @@ export class DiffEditorItemTemplate extends Disposable implements IPooledObject<
 
 	private readonly _collapsed = derived(this, reader => this._viewModel.read(reader)?.collapsed.read(reader));
 
-	private readonly _contentHeight = observableValue<number>(this, 500);
-	public readonly height = derived(this, reader => {
-		const h = this._collapsed.read(reader) ? 0 : this._contentHeight.read(reader);
+	private readonly _editorContentHeight = observableValue<number>(this, 500);
+	public readonly contentHeight = derived(this, reader => {
+		const h = this._collapsed.read(reader) ? 0 : this._editorContentHeight.read(reader);
 		return h + this._outerEditorHeight;
 	});
 
@@ -58,31 +60,22 @@ export class DiffEditorItemTemplate extends Disposable implements IPooledObject<
 	});
 
 	private readonly _elements = h('div.multiDiffEntry', [
-		h('div.content', {
-			style: {
-				display: 'flex',
-				flexDirection: 'column',
-				flex: '1',
-				overflow: 'hidden',
-			}
-		}, [
-			h('div.header@header', [
+		h('div.header@header', [
+			h('div.header-content', [
 				h('div.collapse-button@collapseButton'),
-				h('div.title.show-file-icons@title', [] as any),
+				h('div.file-path', [
+					h('div.title.modified.show-file-icons@primaryPath', [] as any),
+					h('div.status.deleted@status', ['R']),
+					h('div.title.original.show-file-icons@secondaryPath', [] as any),
+				]),
 				h('div.actions@actions'),
 			]),
+		]),
 
-			h('div.editorParent', {
-				style: {
-					flex: '1',
-					display: 'flex',
-					flexDirection: 'column',
-				}
-			}, [
-				h('div.editorContainer@editor', { style: { flex: '1' } }),
-			])
+		h('div.editorParent', [
+			h('div.editorContainer@editor'),
 		])
-	]);
+	]) as Record<string, HTMLElement>;
 
 	public readonly editor = this._register(this._instantiationService.createInstance(DiffEditorWidget, this._elements.editor, {
 		overflowWidgetsDomNode: this._overflowWidgetsDomNode,
@@ -93,7 +86,11 @@ export class DiffEditorItemTemplate extends Disposable implements IPooledObject<
 	public readonly isFocused = derived(this, reader => this.isModifedFocused.read(reader) || this.isOriginalFocused.read(reader));
 
 	private readonly _resourceLabel = this._workbenchUIElementFactory.createResourceLabel
-		? this._register(this._workbenchUIElementFactory.createResourceLabel(this._elements.title))
+		? this._register(this._workbenchUIElementFactory.createResourceLabel(this._elements.primaryPath))
+		: undefined;
+
+	private readonly _resourceLabel2 = this._workbenchUIElementFactory.createResourceLabel
+		? this._register(this._workbenchUIElementFactory.createResourceLabel(this._elements.secondaryPath))
 		: undefined;
 
 	private readonly _outerEditorHeight: number;
@@ -120,22 +117,34 @@ export class DiffEditorItemTemplate extends Disposable implements IPooledObject<
 			this._elements.editor.style.display = this._collapsed.read(reader) ? 'none' : 'block';
 		}));
 
-		this.editor.getModifiedEditor().onDidLayoutChange(e => {
+		this._register(this.editor.getModifiedEditor().onDidLayoutChange(e => {
 			const width = this.editor.getModifiedEditor().getLayoutInfo().contentWidth;
 			this._modifiedWidth.set(width, undefined);
-		});
+		}));
 
-		this.editor.getOriginalEditor().onDidLayoutChange(e => {
+		this._register(this.editor.getOriginalEditor().onDidLayoutChange(e => {
 			const width = this.editor.getOriginalEditor().getLayoutInfo().contentWidth;
 			this._originalWidth.set(width, undefined);
-		});
+		}));
 
 		this._register(this.editor.onDidContentSizeChange(e => {
 			globalTransaction(tx => {
-				this._contentHeight.set(e.contentHeight, tx);
+				this._editorContentHeight.set(e.contentHeight, tx);
 				this._modifiedContentWidth.set(this.editor.getModifiedEditor().getContentWidth(), tx);
 				this._originalContentWidth.set(this.editor.getOriginalEditor().getContentWidth(), tx);
 			});
+		}));
+
+		this._register(this.editor.getOriginalEditor().onDidScrollChange(e => {
+			if (this._isSettingScrollTop) {
+				return;
+			}
+
+			if (!e.scrollTopChanged || !this._data) {
+				return;
+			}
+			const delta = e.scrollTop - this._lastScrollTop;
+			this._data.deltaScrollVertical(delta);
 		}));
 
 		this._register(autorun(reader => {
@@ -144,13 +153,15 @@ export class DiffEditorItemTemplate extends Disposable implements IPooledObject<
 		}));
 
 		this._container.appendChild(this._elements.root);
-		this._outerEditorHeight = 38;
+		this._outerEditorHeight = this._headerHeight;
 
 		this._register(this._instantiationService.createInstance(MenuWorkbenchToolBar, this._elements.actions, MenuId.MultiDiffEditorFileToolbar, {
-			actionRunner: this._register(new ActionRunnerWithContext(() => (this._viewModel.get()?.diffEditorViewModel?.model.modified.uri))),
+			actionRunner: this._register(new ActionRunnerWithContext(() => (this._viewModel.get()?.modifiedUri))),
 			menuOptions: {
 				shouldForwardArgs: true,
-			}
+			},
+			toolbarOptions: { primaryGroup: g => g.startsWith('navigation') },
+			actionViewItemProvider: (action, options) => createActionViewItem(_instantiationService, action, options),
 		}));
 	}
 
@@ -164,7 +175,10 @@ export class DiffEditorItemTemplate extends Disposable implements IPooledObject<
 
 	private readonly _dataStore = new DisposableStore();
 
+	private _data: TemplateData | undefined;
+
 	public setData(data: TemplateData): void {
+		this._data = data;
 		function updateOptions(options: IDiffEditorOptions): IDiffEditorOptions {
 			return {
 				...options,
@@ -180,6 +194,7 @@ export class DiffEditorItemTemplate extends Disposable implements IPooledObject<
 				},
 				renderOverviewRuler: false,
 				fixedOverflowWidgets: true,
+				overviewRulerBorder: false,
 			};
 		}
 
@@ -191,7 +206,29 @@ export class DiffEditorItemTemplate extends Disposable implements IPooledObject<
 			}));
 		}
 		globalTransaction(tx => {
-			this._resourceLabel?.setUri(data.viewModel.diffEditorViewModel.model.modified.uri);
+			this._resourceLabel?.setUri(data.viewModel.modifiedUri ?? data.viewModel.originalUri!, { strikethrough: data.viewModel.modifiedUri === undefined });
+
+			let isRenamed = false;
+			let isDeleted = false;
+			let isAdded = false;
+			let flag = '';
+			if (data.viewModel.modifiedUri && data.viewModel.originalUri && data.viewModel.modifiedUri.path !== data.viewModel.originalUri.path) {
+				flag = 'R';
+				isRenamed = true;
+			} else if (!data.viewModel.modifiedUri) {
+				flag = 'D';
+				isDeleted = true;
+			} else if (!data.viewModel.originalUri) {
+				flag = 'A';
+				isAdded = true;
+			}
+			this._elements.status.classList.toggle('renamed', isRenamed);
+			this._elements.status.classList.toggle('deleted', isDeleted);
+			this._elements.status.classList.toggle('added', isAdded);
+			this._elements.status.innerText = flag;
+
+			this._resourceLabel2?.setUri(isRenamed ? data.viewModel.originalUri : undefined, { strikethrough: true });
+
 			this._dataStore.clear();
 			this._viewModel.set(data.viewModel, tx);
 			this.editor.setModel(data.viewModel.diffEditorViewModel, tx);
@@ -199,7 +236,10 @@ export class DiffEditorItemTemplate extends Disposable implements IPooledObject<
 		});
 	}
 
-	private readonly _headerHeight = this._elements.header.clientHeight;
+	private readonly _headerHeight = /*this._elements.header.clientHeight*/ 48;
+
+	private _lastScrollTop = -1;
+	private _isSettingScrollTop = false;
 
 	public render(verticalRange: OffsetRange, width: number, editorScroll: number, viewPort: OffsetRange): void {
 		this._elements.root.style.visibility = 'visible';
@@ -209,18 +249,26 @@ export class DiffEditorItemTemplate extends Disposable implements IPooledObject<
 		this._elements.root.style.position = 'absolute';
 
 		// For sticky scroll
-		const delta = Math.max(0, Math.min(verticalRange.length - this._headerHeight, viewPort.start - verticalRange.start));
+		const maxDelta = verticalRange.length - this._headerHeight;
+		const delta = Math.max(0, Math.min(viewPort.start - verticalRange.start, maxDelta));
 		this._elements.header.style.transform = `translateY(${delta}px)`;
 
 		globalTransaction(tx => {
 			this.editor.layout({
-				width: width,
+				width: width - 2 * 8 - 2 * 1,
 				height: verticalRange.length - this._outerEditorHeight,
 			});
 		});
-		this.editor.getOriginalEditor().setScrollTop(editorScroll);
+		try {
+			this._isSettingScrollTop = true;
+			this._lastScrollTop = editorScroll;
+			this.editor.getOriginalEditor().setScrollTop(editorScroll);
+		} finally {
+			this._isSettingScrollTop = false;
+		}
 
 		this._elements.header.classList.toggle('shadow', delta > 0 || editorScroll > 0);
+		this._elements.header.classList.toggle('collapsed', delta === maxDelta);
 	}
 
 	public hide(): void {

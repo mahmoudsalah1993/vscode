@@ -6,7 +6,7 @@
 import { localize } from 'vs/nls';
 import { mark } from 'vs/base/common/performance';
 import { Emitter, Event } from 'vs/base/common/event';
-import { Dimension, EventHelper, EventType, ModifierKeyEmitter, addDisposableListener, cloneGlobalStylesheets, copyAttributes, createLinkElement, createMetaElement, getActiveWindow, getClientArea, getWindowId, isGlobalStylesheet, position, registerWindow, sharedMutationObserver, size, trackAttributes } from 'vs/base/browser/dom';
+import { Dimension, EventHelper, EventType, ModifierKeyEmitter, addDisposableListener, cloneGlobalStylesheets, copyAttributes, createLinkElement, createMetaElement, getActiveWindow, getClientArea, getWindowId, isGlobalStylesheet, position, registerWindow, sharedMutationObserver, trackAttributes } from 'vs/base/browser/dom';
 import { CodeWindow, ensureCodeWindow, mainWindow } from 'vs/base/browser/window';
 import { Disposable, DisposableStore, IDisposable, toDisposable } from 'vs/base/common/lifecycle';
 import { InstantiationType, registerSingleton } from 'vs/platform/instantiation/common/extensions';
@@ -21,6 +21,7 @@ import { BaseWindow } from 'vs/workbench/browser/window';
 import { IConfigurationService } from 'vs/platform/configuration/common/configuration';
 import { ITelemetryService } from 'vs/platform/telemetry/common/telemetry';
 import { Barrier } from 'vs/base/common/async';
+import { IHostService } from 'vs/workbench/services/host/browser/host';
 
 export const IAuxiliaryWindowService = createDecorator<IAuxiliaryWindowService>('auxiliaryWindowService');
 
@@ -31,6 +32,7 @@ export interface IAuxiliaryWindowOpenEvent {
 
 export interface IAuxiliaryWindowOpenOptions {
 	readonly bounds?: Partial<IRectangle>;
+	readonly zoomLevel?: number;
 }
 
 export interface IAuxiliaryWindowService {
@@ -44,6 +46,7 @@ export interface IAuxiliaryWindowService {
 
 export interface IAuxiliaryWindow extends IDisposable {
 
+	readonly onWillLayout: Event<Dimension>;
 	readonly onDidLayout: Event<Dimension>;
 
 	readonly onBeforeUnload: Event<void>;
@@ -58,6 +61,9 @@ export interface IAuxiliaryWindow extends IDisposable {
 }
 
 export class AuxiliaryWindow extends BaseWindow implements IAuxiliaryWindow {
+
+	private readonly _onWillLayout = this._register(new Emitter<Dimension>());
+	readonly onWillLayout = this._onWillLayout.event;
 
 	private readonly _onDidLayout = this._register(new Emitter<Dimension>());
 	readonly onDidLayout = this._onDidLayout.event;
@@ -78,8 +84,9 @@ export class AuxiliaryWindow extends BaseWindow implements IAuxiliaryWindow {
 		readonly container: HTMLElement,
 		stylesHaveLoaded: Barrier,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
+		@IHostService hostService: IHostService
 	) {
-		super(window);
+		super(window, undefined, hostService);
 
 		this.whenStylesHaveLoaded = stylesHaveLoaded.wait().then(() => { });
 		this.registerListeners();
@@ -94,13 +101,7 @@ export class AuxiliaryWindow extends BaseWindow implements IAuxiliaryWindow {
 			e.preventDefault();
 		}));
 
-		this._register(addDisposableListener(this.window, EventType.RESIZE, () => {
-			const dimension = getClientArea(this.window.document.body, this.container);
-			position(this.container, 0, 0, 0, 0, 'relative');
-			size(this.container, dimension.width, dimension.height);
-
-			this._onDidLayout.fire(dimension);
-		}));
+		this._register(addDisposableListener(this.window, EventType.RESIZE, () => this.layout()));
 
 		this._register(addDisposableListener(this.container, EventType.SCROLL, () => this.container.scrollTop = 0)); 						// Prevent container from scrolling (#55456)
 
@@ -139,7 +140,17 @@ export class AuxiliaryWindow extends BaseWindow implements IAuxiliaryWindow {
 	}
 
 	layout(): void {
-		this._onDidLayout.fire(getClientArea(this.window.document.body, this.container));
+
+		// Split layout up into two events so that downstream components
+		// have a chance to participate in the beginning or end of the
+		// layout phase.
+		// This helps to build the auxiliary window in another component
+		// in the `onWillLayout` phase and then let other compoments
+		// react when the overall layout has finished in `onDidLayout`.
+
+		const dimension = getClientArea(this.window.document.body, this.container);
+		this._onWillLayout.fire(dimension);
+		this._onDidLayout.fire(dimension);
 	}
 
 	override dispose(): void {
@@ -170,7 +181,8 @@ export class BrowserAuxiliaryWindowService extends Disposable implements IAuxili
 		@IWorkbenchLayoutService private readonly layoutService: IWorkbenchLayoutService,
 		@IDialogService private readonly dialogService: IDialogService,
 		@IConfigurationService protected readonly configurationService: IConfigurationService,
-		@ITelemetryService private readonly telemetryService: ITelemetryService
+		@ITelemetryService private readonly telemetryService: ITelemetryService,
+		@IHostService protected readonly hostService: IHostService
 	) {
 		super();
 	}
@@ -188,7 +200,7 @@ export class BrowserAuxiliaryWindowService extends Disposable implements IAuxili
 		ensureCodeWindow(targetWindow, resolvedWindowId);
 
 		const containerDisposables = new DisposableStore();
-		const { container, stylesLoaded } = this.createContainer(targetWindow, containerDisposables);
+		const { container, stylesLoaded } = this.createContainer(targetWindow, containerDisposables, options);
 
 		const auxiliaryWindow = this.createAuxiliaryWindow(targetWindow, container, stylesLoaded);
 
@@ -225,7 +237,7 @@ export class BrowserAuxiliaryWindowService extends Disposable implements IAuxili
 	}
 
 	protected createAuxiliaryWindow(targetWindow: CodeWindow, container: HTMLElement, stylesLoaded: Barrier): AuxiliaryWindow {
-		return new AuxiliaryWindow(targetWindow, container, stylesLoaded, this.configurationService);
+		return new AuxiliaryWindow(targetWindow, container, stylesLoaded, this.configurationService, this.hostService);
 	}
 
 	private async openWindow(options?: IAuxiliaryWindowOpenOptions): Promise<Window | undefined> {
@@ -280,7 +292,7 @@ export class BrowserAuxiliaryWindowService extends Disposable implements IAuxili
 		return BrowserAuxiliaryWindowService.WINDOW_IDS++;
 	}
 
-	protected createContainer(auxiliaryWindow: CodeWindow, disposables: DisposableStore): { stylesLoaded: Barrier; container: HTMLElement } {
+	protected createContainer(auxiliaryWindow: CodeWindow, disposables: DisposableStore, options?: IAuxiliaryWindowOpenOptions): { stylesLoaded: Barrier; container: HTMLElement } {
 		this.patchMethods(auxiliaryWindow);
 
 		this.applyMeta(auxiliaryWindow);
@@ -415,6 +427,11 @@ export class BrowserAuxiliaryWindowService extends Disposable implements IAuxili
 
 		// Create workbench container and apply classes
 		const container = document.createElement('div');
+		container.setAttribute('role', 'application');
+		position(container, 0, 0, 0, 0, 'relative');
+		container.style.display = 'flex';
+		container.style.height = '100%';
+		container.style.flexDirection = 'column';
 		auxiliaryWindow.document.body.append(container);
 
 		// Track attributes
